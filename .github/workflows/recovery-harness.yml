@@ -1,0 +1,319 @@
+name: Zero-Cost Recovery Harness
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      generation_id:
+        description: 'Optional exact private Resume CI generation (GH-<run>-<attempt>)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zero-cost-recovery-harness
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    name: Discover Pending Recovery Generation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      generation_id: ${{ steps.pick.outputs.generation_id }}
+      git_sha: ${{ steps.pick.outputs.git_sha }}
+      artifact_name: ${{ steps.pick.outputs.artifact_name }}
+      run_id: ${{ steps.pick.outputs.run_id }}
+      run_attempt: ${{ steps.pick.outputs.run_attempt }}
+      need_ch: ${{ steps.pick.outputs.need_ch }}
+      need_rv: ${{ steps.pick.outputs.need_rv }}
+      pending: ${{ steps.pick.outputs.pending }}
+    env:
+      RECOVERY_VAULT_S3_ENDPOINT: ${{ vars.RECOVERY_PROVIDER2_ENDPOINT }}
+      RECOVERY_VAULT_S3_BUCKET: ${{ vars.RECOVERY_PROVIDER2_BUCKET }}
+      AWS_REGION: ${{ vars.RECOVERY_PROVIDER2_REGION }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.RECOVERY_PROVIDER2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.RECOVERY_PROVIDER2_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Validate harness
+        run: |
+          set -euo pipefail
+          python3 -m py_compile scripts/*.py
+          python3 scripts/recovery-vault.py --policy recovery-vault-policy.json --self-test
+          python3 scripts/cross-host-recovery-drill.py --policy cross-host-recovery-policy.json --self-test
+          python3 scripts/recovery-vault-portability.py --policy recovery-vault-policy.json --self-test
+
+      - name: List recovery store
+        run: |
+          set -euo pipefail
+          python3 scripts/recovery-s3-object.py list-prefix /tmp/harness-s3.json 'matin-resume-ci/'
+
+      - name: Select newest pending generation
+        id: pick
+        env:
+          REQUESTED_GENERATION: ${{ inputs.generation_id }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re, subprocess
+          from pathlib import Path
+
+          rows=json.load(open('/tmp/harness-s3.json',encoding='utf-8'))
+          keys={str(r.get('key') or '') for r in rows}
+          pat=re.compile(r'^matin-resume-ci/(GH-([0-9]+)-([0-9]+))/vault/recovery-vault-manifest[.]json$')
+          candidates=[]
+          for key in keys:
+              m=pat.fullmatch(key)
+              if m:
+                  candidates.append((int(m.group(2)),int(m.group(3)),m.group(1)))
+          candidates.sort(reverse=True)
+
+          requested=(os.environ.get('REQUESTED_GENERATION') or '').strip()
+          if requested:
+              candidates=[x for x in candidates if x[2]==requested]
+              if not candidates:
+                  raise SystemExit(f'requested generation not found: {requested}')
+
+          chosen=None
+          for run_id,attempt,generation in candidates:
+              ch=f'matin-resume-ci/{generation}/evidence/ch-1.json'
+              rv=f'matin-resume-ci/{generation}/evidence/rv-1.json'
+              need_ch=ch not in keys
+              need_rv=rv not in keys
+              if need_ch or need_rv:
+                  chosen=(run_id,attempt,generation,need_ch,need_rv)
+                  break
+
+          out=Path(os.environ['GITHUB_OUTPUT'])
+          if not chosen:
+              with out.open('a',encoding='utf-8') as fh:
+                  fh.write('pending=no\n')
+                  fh.write('need_ch=no\n')
+                  fh.write('need_rv=no\n')
+              print('HARNESS_IDLE no pending generation')
+              raise SystemExit(0)
+
+          run_id,attempt,generation,need_ch,need_rv=chosen
+          manifest='/tmp/harness-manifest.json'
+          subprocess.run([
+              'python3','scripts/recovery-s3-object.py','get',manifest,
+              f'matin-resume-ci/{generation}/vault/recovery-vault-manifest.json'
+          ],check=True)
+          doc=json.load(open(manifest,encoding='utf-8'))
+          if doc.get('generation_id') != generation:
+              raise SystemExit('manifest generation mismatch')
+          sha=str(doc.get('git_sha') or '')
+          artifact=str(doc.get('artifact_name') or '')
+          if not re.fullmatch(r'[0-9a-fA-F]{40}',sha):
+              raise SystemExit('manifest git_sha invalid')
+          if not artifact.startswith('matin-resume-recovery-'):
+              raise SystemExit('manifest artifact_name invalid')
+
+          with out.open('a',encoding='utf-8') as fh:
+              fh.write('pending=yes\n')
+              fh.write(f'generation_id={generation}\n')
+              fh.write(f'git_sha={sha}\n')
+              fh.write(f'artifact_name={artifact}\n')
+              fh.write(f'run_id={run_id}\n')
+              fh.write(f'run_attempt={attempt}\n')
+              fh.write(f"need_ch={'yes' if need_ch else 'no'}\n")
+              fh.write(f"need_rv={'yes' if need_rv else 'no'}\n")
+          print(f'HARNESS_PENDING generation={generation} need_ch={need_ch} need_rv={need_rv}')
+          PY
+
+  cross_host:
+    name: Cross-Host Recovery · Public Harness
+    needs: discover
+    if: needs.discover.outputs.pending == 'yes' && needs.discover.outputs.need_ch == 'yes'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RECOVERY_VAULT_S3_ENDPOINT: ${{ vars.RECOVERY_PROVIDER2_ENDPOINT }}
+      RECOVERY_VAULT_S3_BUCKET: ${{ vars.RECOVERY_PROVIDER2_BUCKET }}
+      AWS_REGION: ${{ vars.RECOVERY_PROVIDER2_REGION }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.RECOVERY_PROVIDER2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.RECOVERY_PROVIDER2_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Pull and verify exact recovery vault
+        run: |
+          set -euo pipefail
+          generation='${{ needs.discover.outputs.generation_id }}'
+          rm -rf /tmp/harness-vault /tmp/harness-recovery
+          mkdir -p /tmp/harness-vault /tmp/harness-recovery
+          bash scripts/recovery-vault-s3.sh pull /tmp/harness-vault "matin-resume-ci/$generation/vault"
+          python3 scripts/recovery-vault.py \
+            --policy recovery-vault-policy.json \
+            --verify \
+            --bundle /tmp/harness-vault/recovery-vault.tar.gz \
+            --manifest /tmp/harness-vault/recovery-vault-manifest.json \
+            --extract-to /tmp/harness-recovery
+
+      - name: Run isolated cross-host restore
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          RUNNER_OS_NAME: ${{ runner.os }}
+          RUNNER_ARCH_NAME: ${{ runner.arch }}
+          RUNNER_NAME_VALUE: ${{ runner.name }}
+        run: |
+          set -euo pipefail
+          report_dir=/tmp/harness-ch
+          report="$report_dir/cross-host-recovery-report.json"
+          rm -rf "$report_dir"
+          mkdir -p "$report_dir"
+          python3 scripts/cross-host-recovery-drill.py \
+            --policy cross-host-recovery-policy.json \
+            --artifact-dir /tmp/harness-recovery \
+            --expected-sha '${{ needs.discover.outputs.git_sha }}' \
+            --generation-id '${{ needs.discover.outputs.generation_id }}' \
+            --artifact-name '${{ needs.discover.outputs.artifact_name }}' \
+            --run-id '${{ needs.discover.outputs.run_id }}' \
+            --run-attempt '${{ needs.discover.outputs.run_attempt }}' \
+            --runner-environment "$RUNNER_ENVIRONMENT" \
+            --runner-os "$RUNNER_OS_NAME" \
+            --runner-arch "$RUNNER_ARCH_NAME" \
+            --runner-name "$RUNNER_NAME_VALUE" \
+            --output-report "$report" | tee /tmp/harness-ch.log
+          grep -Fq 'CROSS_HOST_RECOVERY_OK' /tmp/harness-ch.log
+          python3 scripts/cross-host-recovery-drill.py \
+            --policy cross-host-recovery-policy.json \
+            --verify-report "$report"
+
+      - name: Publish CH-1 evidence
+        run: |
+          set -euo pipefail
+          generation='${{ needs.discover.outputs.generation_id }}'
+          key="matin-resume-ci/$generation/evidence/ch-1.json"
+          python3 scripts/recovery-s3-object.py put /tmp/harness-ch/cross-host-recovery-report.json "$key"
+          python3 scripts/recovery-s3-object.py head /tmp/harness-ch/cross-host-recovery-report.json "$key"
+
+  portability:
+    name: Recovery Vault Portability · Public Harness
+    needs: discover
+    if: needs.discover.outputs.pending == 'yes' && needs.discover.outputs.need_rv == 'yes'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RECOVERY_VAULT_S3_ENDPOINT: ${{ vars.RECOVERY_PROVIDER2_ENDPOINT }}
+      RECOVERY_VAULT_S3_BUCKET: ${{ vars.RECOVERY_PROVIDER2_BUCKET }}
+      AWS_REGION: ${{ vars.RECOVERY_PROVIDER2_REGION }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.RECOVERY_PROVIDER2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.RECOVERY_PROVIDER2_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Pull exact recovery vault
+        run: |
+          set -euo pipefail
+          generation='${{ needs.discover.outputs.generation_id }}'
+          rm -rf /tmp/harness-vault
+          mkdir -p /tmp/harness-vault
+          bash scripts/recovery-vault-s3.sh pull /tmp/harness-vault "matin-resume-ci/$generation/vault"
+
+      - name: S3-compatible portability round-trip
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          RUNNER_OS_NAME: ${{ runner.os }}
+          RUNNER_ARCH_NAME: ${{ runner.arch }}
+        run: |
+          set -euo pipefail
+          source_dir=/tmp/harness-vault
+          roundtrip_dir=/tmp/harness-roundtrip
+          report_dir=/tmp/harness-rv
+          mock_root=/tmp/harness-s3-mock
+          mock_log=/tmp/harness-s3-mock.log
+          rm -rf "$roundtrip_dir" "$report_dir" "$mock_root" "$mock_log"
+          mkdir -p "$roundtrip_dir" "$report_dir"
+
+          python3 scripts/s3-portability-mock.py --host 127.0.0.1 --port 4566 --storage-root "$mock_root" >"$mock_log" 2>&1 &
+          mock_pid=$!
+          trap 'kill "$mock_pid" >/dev/null 2>&1 || true; wait "$mock_pid" >/dev/null 2>&1 || true' EXIT
+          for i in $(seq 1 20); do
+            curl -fsS --max-time 2 http://127.0.0.1:4566/healthz | grep -Fxq ok && break
+            sleep 1
+          done
+          grep -Fq 'S3_PORTABILITY_MOCK_READY' "$mock_log"
+
+          python3 scripts/recovery-vault.py --policy recovery-vault-policy.json --verify \
+            --bundle "$source_dir/recovery-vault.tar.gz" \
+            --manifest "$source_dir/recovery-vault-manifest.json"
+
+          export RECOVERY_VAULT_S3_ENDPOINT=http://127.0.0.1:4566
+          export RECOVERY_VAULT_S3_BUCKET=matin-resume-recovery
+          export AWS_ACCESS_KEY_ID=v251harness
+          export AWS_SECRET_ACCESS_KEY=v251harness-secret
+          object_prefix="public-harness/${{ needs.discover.outputs.generation_id }}"
+          bash scripts/recovery-vault-s3.sh push "$source_dir" "$object_prefix"
+          bash scripts/recovery-vault-s3.sh stat "$source_dir" "$object_prefix"
+          bash scripts/recovery-vault-s3.sh pull "$roundtrip_dir" "$object_prefix"
+
+          python3 scripts/recovery-vault.py --policy recovery-vault-policy.json --verify \
+            --bundle "$roundtrip_dir/recovery-vault.tar.gz" \
+            --manifest "$roundtrip_dir/recovery-vault-manifest.json"
+
+          bundle_sha="$(python3 -c 'import json; print(json.load(open("/tmp/harness-vault/recovery-vault-manifest.json"))["bundle_sha256"])')"
+          manifest_seal="$(python3 -c 'import json; print(json.load(open("/tmp/harness-vault/recovery-vault-manifest.json"))["manifest_seal"])')"
+          roundtrip_bundle_sha="$(python3 -c 'import json; print(json.load(open("/tmp/harness-roundtrip/recovery-vault-manifest.json"))["bundle_sha256"])')"
+          roundtrip_manifest_seal="$(python3 -c 'import json; print(json.load(open("/tmp/harness-roundtrip/recovery-vault-manifest.json"))["manifest_seal"])')"
+          started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          python3 scripts/recovery-vault-portability.py \
+            --policy recovery-vault-policy.json \
+            --write-report "$report_dir/recovery-vault-portability-report.json" \
+            --generation-id '${{ needs.discover.outputs.generation_id }}' \
+            --artifact-name '${{ needs.discover.outputs.artifact_name }}' \
+            --git-sha '${{ needs.discover.outputs.git_sha }}' \
+            --runner-environment "$RUNNER_ENVIRONMENT" \
+            --runner-os "$RUNNER_OS_NAME" \
+            --runner-arch "$RUNNER_ARCH_NAME" \
+            --bundle-sha256 "$bundle_sha" \
+            --manifest-seal "$manifest_seal" \
+            --roundtrip-bundle-sha256 "$roundtrip_bundle_sha" \
+            --roundtrip-manifest-seal "$roundtrip_manifest_seal" \
+            --started-at "$started_at" \
+            --finished-at "$finished_at"
+
+          cp "$roundtrip_dir/recovery-vault-manifest.json" "$report_dir/"
+          kill "$mock_pid" >/dev/null 2>&1 || true
+          wait "$mock_pid" >/dev/null 2>&1 || true
+          trap - EXIT
+
+      - name: Publish RV-1 evidence
+        env:
+          RECOVERY_VAULT_S3_ENDPOINT: ${{ vars.RECOVERY_PROVIDER2_ENDPOINT }}
+          RECOVERY_VAULT_S3_BUCKET: ${{ vars.RECOVERY_PROVIDER2_BUCKET }}
+          AWS_REGION: ${{ vars.RECOVERY_PROVIDER2_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.RECOVERY_PROVIDER2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.RECOVERY_PROVIDER2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          generation='${{ needs.discover.outputs.generation_id }}'
+          prefix="matin-resume-ci/$generation/evidence"
+          python3 scripts/recovery-s3-object.py put /tmp/harness-rv/recovery-vault-portability-report.json "$prefix/rv-1.json"
+          python3 scripts/recovery-s3-object.py put /tmp/harness-rv/recovery-vault-manifest.json "$prefix/rv-1-manifest.json"
+          python3 scripts/recovery-s3-object.py head /tmp/harness-rv/recovery-vault-portability-report.json "$prefix/rv-1.json"
+          python3 scripts/recovery-s3-object.py head /tmp/harness-rv/recovery-vault-manifest.json "$prefix/rv-1-manifest.json"
+
+  summary:
+    name: Harness Summary
+    needs: [discover, cross_host, portability]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summary
+        run: |
+          {
+            echo '### Zero-Cost Recovery Harness'
+            echo ''
+            echo "- Pending: **${{ needs.discover.outputs.pending || 'unknown' }}**"
+            echo "- Generation: **${{ needs.discover.outputs.generation_id || 'none' }}**"
+            echo "- CH-1 job: **${{ needs.cross_host.result }}**"
+            echo "- RV-1 job: **${{ needs.portability.result }}**"
+          } >> "$GITHUB_STEP_SUMMARY"

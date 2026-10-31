@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "drill_version": "CH-1",
+  "mode": "github-hosted-cross-host-restore",
+  "required_runner_environment": "github-hosted",
+  "required_runs_on": "ubuntu-latest",
+  "restored_network": "none",
+  "production_container": "matin-resume",
+  "production_state_path": "/var/lib/matin-resume",
+  "report_file": "/var/lib/matin-resume/ci/cross-host-recovery-report.json",
+  "report_artifact_retention_days": 30,
+  "report_seal_algorithm": "sha256",
+  "report_canonicalization": "compact-json-sorted-keys-excluding-report_seal",
+  "required_checks": [
+    "artifact_chain",
+    "immutable_archive",
+    "github_hosted_runner",
+    "production_container_absent",
+    "production_state_absent",
+    "recovery_tag_absent_before",
+    "docker_load",
+    "isolated_health",
+    "restored_build",
+    "restored_attestation",
+    "recovery_tag_cleanup",
+    "container_cleanup"
+  ],
+  "safety_invariant": "The CH-1 job runs on GitHub-hosted ubuntu-latest, receives no VPS credentials, never mounts or addresses Production state, requires the Production container and /var/lib/matin-resume state to be absent, and runs the restored workload with --network none.",
+  "publication_rule": "AC-1 persistent state advances only after the recovery artifact, DR-1, FH-1 and CH-1 evidence artifacts are all uploaded and validated; CH-1 must restore the same AC-1 generation on a GitHub-hosted runner separate from the Production VPS."
+}

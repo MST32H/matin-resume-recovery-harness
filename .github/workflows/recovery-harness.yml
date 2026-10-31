@@ -1,8 +1,8 @@
 name: Zero-Cost Recovery Harness
 
 on:
-  schedule:
-    - cron: '*/15 * * * *'
+  repository_dispatch:
+    types: [matin-resume-recovery]
   workflow_dispatch:
     inputs:
       generation_id:
@@ -56,7 +56,7 @@ jobs:
       - name: Select newest pending generation
         id: pick
         env:
-          REQUESTED_GENERATION: ${{ inputs.generation_id }}
+          REQUESTED_GENERATION: ${{ github.event.client_payload.generation_id || inputs.generation_id }}
         run: |
           set -euo pipefail
           python3 - <<'PY'

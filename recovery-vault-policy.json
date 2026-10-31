@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "vault_version": "RV-1",
+  "format": "deterministic-tar-gzip",
+  "provider_protocol": "s3-compatible",
+  "provider_adapter": "stdlib-sigv4-path-style",
+  "bundle_name": "recovery-vault.tar.gz",
+  "manifest_name": "recovery-vault-manifest.json",
+  "portability_report_name": "recovery-vault-portability-report.json",
+  "retention_days": 30,
+  "required_recovery_files": [
+    "production-image.tar.gz",
+    "immutable-image-manifest.json",
+    "production-image-identity.json",
+    "recovery-checkpoint.json",
+    "deployment-attestation-history.jsonl",
+    "recovery-artifact-chain.jsonl",
+    "build.json",
+    "release-attestation.json"
+  ],
+  "manifest_seal_algorithm": "sha256",
+  "manifest_canonicalization": "compact-json-sorted-keys-excluding-manifest_seal",
+  "portability_test": "GitHub-hosted ubuntu-latest uploads the RV-1 bundle and manifest through a standard-library AWS SigV4 path-style S3 client to a disposable S3-compatible compatibility endpoint, downloads both back, and verifies exact digests and bindings.",
+  "provider_diversity_claim_rule": "Do not claim strict 3-2-1 backup while the current authoritative recovery locations are only the Production VPS and one independently operated non-GitHub S3-compatible external recovery store. A second non-GitHub provider or other independent recovery medium must be enrolled and verified before strict 3-2-1 is claimed.",
+  "three_two_one_target": "Production VPS plus the current external S3 recovery store plus one additional independently operated recovery copy or medium; GitHub Actions artifact storage is not required."
+}
